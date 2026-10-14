@@ -359,6 +359,18 @@ def get_channels():
         return JSONResponse(content=proxy_instance.catalog_data)
     return JSONResponse(content={})
 
+@api.get("/anime")
+@api.get("/anime/resolve")
+def resolve_anime(url: str = ""):
+    if not url:
+        return JSONResponse(content={"status": "error", "message": "Missing 'url' parameter"}, status_code=400)
+    try:
+        from anime_resolver import resolve_anime_wco
+        res = resolve_anime_wco(url)
+        return JSONResponse(content=res, status_code=200 if res.get("status") == "ready" else 502)
+    except Exception as e:
+        return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+
 @api.get("/", response_class=HTMLResponse)
 def home():
     return """<!DOCTYPE html>
