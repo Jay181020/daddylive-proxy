@@ -315,7 +315,7 @@ proxy_instance = DaddyLiveProxy()
 # ---------------------------------------------------------------------------
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse, StreamingResponse
 
 api = FastAPI(title="LetsWatch DaddyLive Proxy")
 
@@ -361,15 +361,127 @@ def get_channels():
 
 @api.get("/anime")
 @api.get("/anime/resolve")
-def resolve_anime(url: str = ""):
+def resolve_anime(request: Request, url: str = ""):
     if not url:
         return JSONResponse(content={"status": "error", "message": "Missing 'url' parameter"}, status_code=400)
     try:
         from anime_resolver import resolve_anime_wco
-        res = resolve_anime_wco(url)
+        host = request.headers.get("host", "")
+        proto = request.headers.get("x-forwarded-proto", "https" if ":" not in host else "http")
+        res = dict(resolve_anime_wco(url))
+        if res.get("status") == "ready":
+            quoted_ep = urllib.parse.quote_plus(url)
+            if res.get("mp4_url"):
+                res["proxy_mp4_url"] = f"{proto}://{host}/anime/stream.mp4?url={quoted_ep}"
+            if res.get("hls_url"):
+                res["proxy_hls_url"] = f"{proto}://{host}/anime/hls/master.m3u8?url={quoted_ep}"
+            res["stream_url"] = res.get("proxy_mp4_url") or res.get("proxy_hls_url") or res.get("url")
         return JSONResponse(content=res, status_code=200 if res.get("status") == "ready" else 502)
     except Exception as e:
         return JSONResponse(content={"status": "error", "message": str(e)}, status_code=500)
+
+@api.get("/anime/stream")
+@api.get("/anime/stream.mp4")
+def stream_anime_mp4(request: Request, url: str = ""):
+    if not url:
+        return Response(content="Missing 'url' parameter", status_code=400)
+    try:
+        from anime_resolver import resolve_anime_wco
+        res = resolve_anime_wco(url)
+        mp4_url = res.get("mp4_url") or res.get("url")
+        if not mp4_url:
+            return Response(content="Failed to resolve WCO MP4 stream", status_code=502)
+        up_headers = dict(res.get("headers") or {})
+        range_hdr = request.headers.get("range")
+        if range_hdr:
+            up_headers["Range"] = range_hdr
+        req = urllib.request.Request(mp4_url, headers=up_headers)
+        up_resp = urllib.request.urlopen(req, timeout=15)
+        status = getattr(up_resp, "status", 200)
+        resp_headers = {
+            "Accept-Ranges": "bytes",
+            "Access-Control-Allow-Origin": "*"
+        }
+        if up_resp.headers.get("Content-Length"):
+            resp_headers["Content-Length"] = up_resp.headers.get("Content-Length")
+        if up_resp.headers.get("Content-Range"):
+            resp_headers["Content-Range"] = up_resp.headers.get("Content-Range")
+        ctype = up_resp.headers.get("Content-Type", "video/mp4")
+
+        def _iter_chunks():
+            try:
+                while True:
+                    chunk = up_resp.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                try:
+                    up_resp.close()
+                except Exception:
+                    pass
+
+        return StreamingResponse(_iter_chunks(), status_code=status, media_type=ctype, headers=resp_headers)
+    except Exception as e:
+        return Response(content=f"Anime stream proxy error: {e}", status_code=502)
+
+@api.get("/anime/hls/master.m3u8")
+def stream_anime_hls_master(request: Request, url: str = ""):
+    if not url:
+        return Response(content="Missing 'url' parameter", status_code=400)
+    try:
+        from anime_resolver import resolve_anime_wco, rewrite_wco_m3u8, DEFAULT_UA
+        res = resolve_anime_wco(url)
+        hls_url = res.get("hls_url")
+        if not hls_url:
+            return Response(content="No HLS stream available", status_code=502)
+        host = request.headers.get("host", "")
+        proto = request.headers.get("x-forwarded-proto", "https" if ":" not in host else "http")
+        req = urllib.request.Request(hls_url, headers={
+            "User-Agent": DEFAULT_UA,
+            "Referer": "https://vhs.wcostream.com/"
+        })
+        with urllib.request.urlopen(req, timeout=10) as up_resp:
+            m3u8_text = up_resp.read().decode("utf-8", "ignore")
+        rewritten = rewrite_wco_m3u8(m3u8_text, hls_url, proto, host)
+        return Response(
+            content=rewritten,
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except Exception as e:
+        return Response(content=f"Anime HLS master error: {e}", status_code=502)
+
+@api.get("/anime/hls/proxy")
+def stream_anime_hls_proxy(request: Request, url: str = ""):
+    if not url:
+        return Response(content="Missing 'url' parameter", status_code=400)
+    try:
+        from anime_resolver import rewrite_wco_m3u8, DEFAULT_UA
+        host = request.headers.get("host", "")
+        proto = request.headers.get("x-forwarded-proto", "https" if ":" not in host else "http")
+        req = urllib.request.Request(url, headers={
+            "User-Agent": DEFAULT_UA,
+            "Referer": "https://vhs.wcostream.com/"
+        })
+        with urllib.request.urlopen(req, timeout=12) as up_resp:
+            ctype = up_resp.headers.get("Content-Type", "application/octet-stream")
+            raw_body = up_resp.read()
+        if ".m3u8" in url or "mpegurl" in ctype.lower() or raw_body.startswith(b"#EXTM3U"):
+            text_body = raw_body.decode("utf-8", "ignore")
+            rewritten = rewrite_wco_m3u8(text_body, url, proto, host)
+            return Response(
+                content=rewritten,
+                media_type="application/vnd.apple.mpegurl",
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+        return Response(
+            content=raw_body,
+            media_type=ctype,
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except Exception as e:
+        return Response(content=f"Anime HLS proxy error: {e}", status_code=502)
 
 @api.get("/", response_class=HTMLResponse)
 def home():
